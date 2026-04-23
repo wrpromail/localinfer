@@ -9,8 +9,13 @@ QwenRMSNorm = rmsnorm_module.QwenRMSNorm
 
 class QwenLinearAttentionBlock(nn.Module):
     """
-    Qwen3.5 的 Gated Linear Attention (GLA) / Mamba 变体
-    这里展示的是它在自回归生成（Decode 阶段，每次 1 个词）时的真实物理运行机理！
+    Qwen3.5 的 Gated Linear Attention (GLA) / Mamba 变体——教学版。
+
+    本文件的目的是展示自回归生成（Decode）阶段的单步运行机理。
+
+    ⚠️ 与完整版（08_generate.py QwenLinearAttentionBlock）的差异：
+    - 本版 conv1d 部分为教学占位，直接透传 qkv，未做真实巧移分离卷积计算。
+    - 本版 g/beta/rnn 更新公式为简化示意，完整版包含 l2norm、f32 精度转换和精确的 Delta Rule。
     """
     def __init__(self, hidden_size=1024, num_heads=16, head_dim=128):
         super().__init__()
@@ -55,10 +60,11 @@ class QwenLinearAttentionBlock(nn.Module):
         # 1. QKV 投影
         qkv = self.in_proj_qkv(x) # [1, 6144]
         
-        # 2. 1D 卷积更新局部特征 (伪代码逻辑，我们用简单的相加代替真实的卷积核相乘)
-        # 实际是在做：当前 qkv 和 conv_state 里的历史进行加权
-        # 更新 conv_state (丢掉最老的，塞入最新的)
-        qkv_conv = qkv # 假设这是被 conv1d 处理过后的 qkv
+        # 2. 1D 卷积更新局部特征——教学占位版（简化透传）
+        # 实际应将 conv_state 里过去 3 步的特征与当前 qkv 做带权当的滑动卷积计算。
+        # 此处用直接透传代替，省略卷积运算以便聚焦主干道的状态机逻辑。
+        # 完整的 conv1d 卡移缓冲实现，请参考 08_generate.py QwenLinearAttentionBlock.forward()
+        qkv_conv = qkv  # 这里直接透传，未做真实卷积
         
         # 3. 切分 Q, K, V
         # 形状全都是 [1, 16, 128]

@@ -184,7 +184,13 @@ class QwenLinearAttentionBlock(nn.Module):
         g_t = g[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
         beta_t = beta[:, :, 0].unsqueeze(-1)
         
-        # 核心 Delta 更新
+        # ★ GLA (Gated Linear Attention) Delta Rule 核心更新
+        # 完整数学推导：
+        # 1. rnn_state = rnn_state * exp(g_t)   => 旧记忆按当前词的“遗忘门”指数衰减
+        # 2. kv_mem = (rnn_state * k_t).sum(-2) => 用 K_t 从旧状态中检索已有预期 V
+        # 3. delta = (v_t - kv_mem) * beta_t    => 计算“预期偏差”，beta 控制融入比例
+        # 4. rnn_state += k_t * delta            => 将修正后的新知识写入记忆矩阵
+        # 数学上等价于在线最小二乘更新（online least-squares update）
         rnn_state = rnn_state * g_t
         kv_mem = (rnn_state * k_t.unsqueeze(-1)).sum(dim=-2)
         delta = (v_t - kv_mem) * beta_t
@@ -260,6 +266,9 @@ def load_weights(model, safetensor_path):
         
         for i in range(24):
             layer = model.layers[i]
+            # 前缀检测：Qwen3.5 某些实验版本（Multi-Token Prediction 分支）会把权重存在
+            # "mtp.layers.{i}." 前缀下；若不存在则回落到标准的 "model.language_model.layers.{i}."。
+            # 目前公开发布的可用权重均使用标准前缀，mtp 分支仅在实验性 checkpoint 中出现。
             prefix = f"model.language_model.layers.{i}." if f"model.language_model.layers.{i}.input_layernorm.weight" in f.keys() else f"mtp.layers.{i}."
             if prefix == f"mtp.layers.{i}." and f"{prefix}input_layernorm.weight" not in f.keys():
                 prefix = f"model.language_model.layers.{i}."
@@ -313,6 +322,10 @@ def main():
     caches = [None] * 24
     
     # === Prefill 阶段 (逐词暖机) ===
+    # ⚠️ 设计限制说明：此处采用「token-by-token」逐词串行消化 prompt。
+    # 原因：Linear Attention 的状态机必须依赖上一时刻的状态， Python 层无法实现并行前缀扫描算法。
+    # 副作用：全注意力层在 prefill 期间也是逐步积累 KV Cache，而非标准的“一次看全 prompt”。
+    # 这是一种近似：对模型最终生成结果影响有限，但导致冷启动速度深受制限。
     print("\n[ 系统正在逐词流式消化 Prompt (Prefill)... ]")
     for i in range(input_ids.shape[1] - 1):
         token_id = input_ids[:, i:i+1]

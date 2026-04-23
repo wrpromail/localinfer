@@ -1,0 +1,11 @@
+[project]
+name = "localinfer"
+version = "0.1.0"
+description = "A from-scratch implementation of Qwen3 local inference."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "safetensors>=0.4.0",
+    "transformers>=4.40.0"
+]

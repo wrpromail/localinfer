@@ -10,6 +10,14 @@ rope_module = SourceFileLoader("rope", "04_rope.py").load_module()
 QwenRoPE = rope_module.QwenRoPE
 
 class FullAttentionBlock(nn.Module):
+    """
+    Qwen3.5-0.8B 的全注意力块（Gated Attention）教学版实现。
+
+    ⚠️ 与完整版（08_generate.py）的差异：
+    1. 本版本不含 q_norm / k_norm（QwenRMSNorm on head_dim），完整版有。
+    2. 本版本不含 causal mask，仅适用于单步 decode（seq_len=1）。
+       如需用于 prefill（seq_len>1），请参考 09_qwen3_0_6b_generate.py 的实现。
+    """
     def __init__(self, hidden_size=1024, num_heads=8, num_kv_heads=2, head_dim=256):
         super().__init__()
         self.hidden_size = hidden_size
@@ -53,6 +61,10 @@ class FullAttentionBlock(nn.Module):
         
         # 5. Attention 计算
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # ⚠️ 本实现未加 causal mask（因果掩码）。
+        # 对单步 decode（seq_len=1）不需要掩码，但对 prefill（seq_len>1）会导致
+        # 未来 token 的信息泄露，结果将不正确。
+        # 完整带 causal mask 的实现见：09_qwen3_0_6b_generate.py FullAttentionBlock.forward()
         attn_weights = torch.nn.functional.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, v)
         

@@ -1,6 +1,6 @@
 import os
 try:
-    from safetensors import safe_open
+    from safetensors.torch import safe_open  # 与项目其他脚本保持一致，返回 PyTorch tensor
 except ImportError:
     print("Please install safetensors and torch first: pip install safetensors torch")
     exit(1)
