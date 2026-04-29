@@ -98,20 +98,21 @@
 
 ### 📋 Phase 5：推理加速（当前重点）
 
-#### 5-A：FlashAttention 替换（优先级：最高）
-> **目标**：用 `F.scaled_dot_product_attention` 替换 `09` 里的手写 matmul + softmax
+#### ✅ 5-A：FlashAttention 替换（已完成）
+> **目标**：用 `F.scaled_dot_product_attention` 替换手写 matmul + softmax  
+> **完成**：已内置到 `10_backend_benchmark.py` 的 `FullAttentionBlock`
 
 ```python
-# 修改 09_qwen3_0_6b_generate.py 的 FullAttentionBlock.forward()
-attn_output = F.scaled_dot_product_attention(
+# 10_backend_benchmark.py — FullAttentionBlock.forward()
+attn_out = F.scaled_dot_product_attention(
     q, k_rep, v_rep,
-    is_causal=(seq_len > 1)  # decode 时 seq_len=1，无需 causal mask
+    is_causal=(S > 1)   # decode 时 S=1，无需 causal mask
 )
 ```
 
-**预期验证**：
-- CPU 下加速不明显（MPS 和 CUDA 才能发挥 FlashAttention 效果）
-- 为后续 GPU 实验建立正确的接口基础
+**实测结果（Mac CPU arm，bfloat16，decode 10 tokens）**：
+- TBT: **28ms**（vs 旧版 57ms），约 **2x 提速**（SDPA 在 CPU 上也有优化）
+- CUDA 上将自动调度 FlashAttention-2 kernel，预期再提速 3~5x
 
 ---
 
@@ -141,18 +142,96 @@ attn_output = F.scaled_dot_product_attention(
 
 ---
 
-#### 5-D：torch.compile 静态图优化
-> 修改 `09`，在 decode 阶段（输入 shape 固定为 `[1,1]`）启用
+#### ✅ 5-D：torch.compile + 静态 KV Cache（已完成）
+> **目标**：在 Mac MPS 上验证图编译对 decode 阶段的收益  
+> **完成**：新增 `11_mps_compile_kv_benchmark.py`，用预分配静态 KV Cache 固定图形状
 
 ```python
-model_compiled = torch.compile(model.forward_step, mode="reduce-overhead")
+compiled_runner = torch.compile(
+    StaticKVForward(model, max_cache_len=64, device="mps"),
+    mode="reduce-overhead",
+)
 ```
 
-**预期加速**：decode 阶段 20~40%（消除 Python 层 overhead）
+**实测结果（Mac MPS，float16，max_cache_len=64）**：
+- eager static KV：TBT **25-26ms**，约 **39 tokens/s**
+- compile static KV：TBT **12-13ms**，约 **75-81 tokens/s**
+- 首次编译 warmup：**26.50s**，适合长会话/常驻服务摊销
+
+**文档**：
+- 测试结果：[metal_benchmark.md](metal_benchmark.md)
+- 原理说明：[basic/04_torch_compile_static_kv.md](basic/04_torch_compile_static_kv.md)
 
 ---
 
-#### 5-E：Speculative Decoding（可选探索）
+#### 5-E：Mac MPS 后续优化实验（下一步）
+
+> **目标**：继续在 macOS 上学习“动态图/静态图、KV Cache、dtype、prompt 长度、量化”之间的性能权衡。
+
+**推荐实验矩阵**：
+
+| 实验 | 脚本/命令 | 学习目标 |
+|------|----------|----------|
+| max_cache_len 扫描 | `11_mps_compile_kv_benchmark.py --max-cache-len 32/64/128` | 固定图长度越大，编译图越稳定，但 attention 计算越浪费 |
+| 动态 KV vs 静态 KV eager | `--skip-compile --include-dynamic-kv` | 对比真实历史长度 vs 固定 cache 长度的 eager 成本 |
+| float16 vs float32 compile | `--dtype float16/float32` | 验证 MPS 不同 dtype 的 kernel 成熟度和内存差异 |
+| prompt 长度扫描 | 构造 4/32/128/512 tokens prompt | 分离 prefill 和 decode 的瓶颈 |
+| SDPA vs 手写 attention | 保留手写 matmul + softmax 版本 | 理解 PyTorch SDPA 在 MPS 上的收益 |
+| block/static KV 折中 | 设计 block cache，例如 64/128 token 一块 | 学习接近 PagedAttention 的 cache 管理思路 |
+
+**建议优先顺序**：
+1. `max_cache_len=32/64/128` 扫描，观察 compile warmup、TBT、内存变化。
+2. `dynamic KV eager` vs `static KV eager` vs `static KV compile` 三者横向对比。
+3. 用较长 prompt 测 prefill/decode 分界。
+4. 再考虑 block KV Cache，避免一次性固定到很大的 `max_cache_len`。
+
+---
+
+#### 5-F：MLX 生态学习与对比（下一步）
+
+> **目标**：了解 Apple Silicon 原生推理生态，与 PyTorch/MPS 手写推理引擎形成对照。
+
+**MLX 适合学习的点**：
+- Apple 官方机器学习框架，围绕 Unified Memory 设计。
+- `mlx-lm` 提供本地 LLM 推理工具链。
+- MLX community 有大量 4-bit / 8-bit 量化模型，适合 macOS 本地推理。
+- 与当前 PyTorch/MPS 项目互补：PyTorch 手写实现适合理解推理内部，MLX 适合理解 Apple 原生高性能推理路径。
+
+**建议新增实验脚本**：`12_mlx_benchmark.py`
+
+**推荐实验矩阵**：
+
+| 实验 | 对比对象 | 学习目标 |
+|------|----------|----------|
+| MLX fp16 生成速度 | PyTorch MPS dynamic KV eager | 框架级推理路径对比 |
+| MLX 4bit 生成速度 | PyTorch MPS float16 | 量化对内存带宽和速度的影响 |
+| MLX prompt 长度扫描 | PyTorch MPS prompt 长度扫描 | 比较 prefill/decode 行为 |
+| MLX 内存占用 | PyTorch MPS Mem(MB) | Apple Unified Memory 下量化收益 |
+
+**建议先跑现成模型**：
+```bash
+pip install mlx-lm
+
+mlx_lm.generate \
+  --model mlx-community/Qwen3-0.6B-4bit \
+  --prompt "人工智能的未来是" \
+  --max-tokens 100
+```
+
+> 模型名称需要以 MLX community 实际可用模型为准。如果没有 Qwen3-0.6B，可先用 Qwen2.5/其他小模型跑通 MLX benchmark 流程。
+
+**最终推荐横向表**：
+
+| 路线 | 配置 | 重点指标 |
+|------|------|----------|
+| PyTorch MPS | dynamic KV eager | 自然手写推理 baseline |
+| PyTorch MPS | static KV eager | 固定图形状成本 |
+| PyTorch MPS | static KV compile | 图编译收益 |
+| MLX | fp16 / 4bit | Apple 原生推理生态与量化收益 |
+
+---
+
+#### 5-G：Speculative Decoding（可选探索）
 基于 Qwen3-0.6B 作为 Draft Model，人工构造简单的 n-gram 候选，体验"并行验证"的加速机制。
 
 ---
@@ -173,48 +252,132 @@ AMD MI250 / ROCm
 
 #### 每个平台的实验清单
 
-**Mac MPS**（下一步）：
-```python
-device = torch.device("mps")
-# 注意：MPS bfloat16 支持有限，可能需要 float16
+**Mac Metal (MPS) — 加速点全景**：
+
+> MPS 最大优势：**Unified Memory**，CPU/GPU 零拷贝共享物理内存（M4 Pro 带宽 ~273 GB/s）。
+
+| 优先级 | 技术 | 说明 | 注意事项 |
+|--------|------|------|---------|
+| ⭐⭐⭐ | **基础迁移 `device="mps"`** | `10_backend_benchmark.py` 已支持，立刻可测 | **bfloat16 → 自动降级 float16** |
+| ⭐⭐⭐ | **SDPA on MPS** | PyTorch ≥2.1 MPS 后端支持 SDPA，走 Metal shader | 非 FlashAttention，是 Metal kernel 近似 |
+| ⭐⭐ | **float16 精度** | 统一内存高带宽，矩阵乘法受益明显 | bf16 在部分 MPS 版本不稳定 |
+| ✅ | **torch.compile + 静态 KV** | 已实测 TBT 25-26ms → 12-13ms | warmup ~26.5s，需长会话摊销 |
+| ⭐⭐ | **max_cache_len 扫描** | 32/64/128 固定 cache 长度对比 | 固定长度越大，计算浪费越多 |
+| ⭐⭐ | **动态 KV vs 静态 KV** | 对比 eager 自然实现与 compile 友好实现 | 理解工程 trade-off |
+| ⭐⭐ | **W8A16 手写量化** | 统一内存下带宽节省效果比 CUDA 更显著 | MPS 无 bitsandbytes，需手写 |
+| ⭐⭐ | **MLX / mlx-lm** | Apple 原生推理生态，适合 4bit/8bit 模型 | 建议单独脚本 `12_mlx_benchmark.py` |
+| ⭐ | **Metal Performance Shaders (MPSGraph)** | Apple 官方 C++/ObjC API，可绕过 PyTorch 写 Metal kernel | 需要 Swift/ObjC，学习成本高 |
+| ❌ | **FlashAttention-2 官方包** | flash-attn 库不支持 MPS | 只能靠 PyTorch SDPA 近似 |
+| ❌ | **bitsandbytes** | 不支持 MPS | 只能手写量化 |
+
+**推荐实验顺序**（当前 Mac 上可立即执行）：
+```bash
+# Step 1：基础迁移，对比 CPU 基线
+python 10_backend_benchmark.py --backend mps --dtype float16 --decode-steps 50
+
+# Step 2：精度对比（查看 float32 是否更稳定）
+python 10_backend_benchmark.py --backend mps --dtype float32 --decode-steps 50
+
+# Step 3：静态 KV + torch.compile 对比
+python 11_mps_compile_kv_benchmark.py --dtype float16 --decode-lengths 1 5 10 20 50 --max-cache-len 64
+
+# Step 4：MLX 生态对比（待新增 12_mlx_benchmark.py）
+mlx_lm.generate --model mlx-community/Qwen3-0.6B-4bit --prompt "人工智能的未来是" --max-tokens 100
+
+# Step 5：性能分析 — Xcode Instruments → Metal System Trace
 ```
-- 对比：CPU vs MPS 的 decode 速度
 
-**NVIDIA GPU**：
+
+**NVIDIA GPU — CUDA 加速点全景**：
+
+| 优先级 | 技术 | 作用位置 | 预期收益 | 实现难度 |
+|--------|------|---------|---------|--------|
+| ⭐⭐⭐ | **FlashAttention 2**（SDPA 已内置） | Attention QKV 计算 | Prefill 10x+，Decode 3~5x | ✅ 已完成 |
+| ⭐⭐⭐ | **CUDA Graph** | Decode loop 每步 | 消除 kernel launch，30~50% | 中 |
+| ⭐⭐⭐ | **device="cuda" 基础迁移** | 全模型 | GPU 并行，预计 10~30x vs CPU | 低 |
+| ⭐⭐ | **torch.compile** | forward_step | Python overhead 减少 20~30% | 低 |
+| ⭐⭐ | **W8A16 量化** | 全部 Linear 层 | 显存减半，带宽瓶颈消除 | 中 |
+| ⭐⭐ | **INT8 KV Cache** | 长文本 KV 存储 | 显存 50%，>4K token 关键 | 中 |
+| ⭐ | **Speculative Decoding** | 生成循环 | 吞吐 2~3x（batch=1 时效果有限） | 高 |
+| ⭐ | **AutoGPTQ W4 量化** | Linear 层 | 显存再减半（需要 GPU 才划算）| 高 |
+
 ```python
-# Step 1：基础迁移
-device = torch.device("cuda")
+# Step 1：基础迁移（直接用 10_backend_benchmark.py）
+python 10_backend_benchmark.py --backend cuda --decode-steps 50
 
-# Step 2：Flash Attention SDPA（A10 上自动使用 Flash Attention 内核）
-attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-# Step 3：CUDA Graph（消除 kernel launch overhead）
+# Step 2：CUDA Graph（消除 kernel launch overhead）
 g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
-    logits, caches = model.forward_step(...)
-# 后续 decode 步骤：g.replay()
+    logits, caches = model.forward_step(current_token, caches, pos)
+# 后续 decode：g.replay()  # 零 Python overhead
 
-# Step 4：性能分析
-# torch.profiler → nsys → ncu（逐步深入）
+# Step 3：torch.compile
+model_compiled = torch.compile(model.forward_step, mode="reduce-overhead")
+
+# Step 4：性能分析工具链
+# torch.profiler  →  nsys（系统级）  →  ncu（kernel 级）
 ```
 
-**AMD ROCm**：
+**推荐实验顺序**（在云端 A10/A100 上）：
+1. `--backend cuda`（基础迁移，验证 GPU 加速基线）
+2. 加入 `torch.compile`，对比 Decode TBT
+3. CUDA Graph 手动实验，对比 kernel launch overhead
+4. W8A16 量化，对比显存与速度
+
+---
+
+**AMD ROCm — 加速点全景**：
+
+> ROCm 核心优势：PyTorch 代码层**零修改**，通过 HIP 桥接 CUDA API。
+
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.0
-# 代码层面基本零修改（PyTorch 通过 HIP 桥接）
-# 性能分析：rocm-smi / rocprof
+# 安装 ROCm 版 PyTorch（ROCm 6.0，对应 MI200/MI300/RX 7900 系列）
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+
+# 验证（ROCm 下 torch.cuda.is_available() 仍返回 True）
+python -c "import torch; print(torch.version.hip)"  # 确认是 HIP 构建
 ```
+
+| 优先级 | 技术 | 说明 | 与 CUDA 的差异 |
+|--------|------|------|--------------|
+| ⭐⭐⭐ | **基础迁移 `device="cuda"`** | ROCm 将 `cuda` 设备映射到 AMD GPU，代码无需改 | 仅安装包不同 |
+| ⭐⭐⭐ | **SDPA / flash_attn_rocm** | SDPA 在 ROCm 走 `flash_attn_rocm` 后端 | 部分 GPU 内核支持度不如 A100 |
+| ⭐⭐ | **torch.compile on ROCm** | HIP 编译，效果与 CUDA 相当 | 编译时间更长 |
+| ⭐⭐ | **W8A16 手写量化** | 反量化逻辑完全可移植 | 无差异 |
+| ⭐⭐ | **bitsandbytes-rocm** | 支持 INT8/NF4，需安装 ROCm 版 | `pip install bitsandbytes-rocm` |
+| ⭐ | **Triton on ROCm** | `triton-rocm` 已成熟，可写自定义 kernel | Triton API 相同，后端走 HIP |
+| ⭐ | **性能分析** | `rocm-smi`（显存/功耗）+ `rocprof`（kernel trace） | 类比 `nvidia-smi` + `nsys` |
+
+**推荐实验顺序**（在 AMD GPU 机器上）：
+1. 安装 ROCm PyTorch → 直接运行 `python 10_backend_benchmark.py --backend cuda`
+2. 用 `rocm-smi` 监控显存占用
+3. `rocprof --stats python 10_backend_benchmark.py ...` 查看 kernel 热点
+4. 若 SDPA 有问题，回退到手写 matmul + softmax 对比
+
+---
+
+**四平台横向对比总览**：
+
+| 维度 | CPU (当前) | Mac MPS | AMD ROCm | NVIDIA CUDA |
+|------|-----------|---------|----------|------------|
+| 立刻可测 | ✅ | ✅ 现在就行 | ❌ 需 AMD 硬件 | ❌ 需云实例 |
+| 代码修改量 | 基准 | 几乎零 | 零 | 零 |
+| FlashAttention | SDPA ✅ | SDPA Metal 近似 | flash_attn_rocm ✅ | FA2 完整 ✅ |
+| 量化库支持 | 手写 | 手写 | bitsandbytes-rocm | bitsandbytes / AutoGPTQ |
+| 自定义 kernel | ❌ | Metal shader (难) | Triton-ROCm ✅ | Triton / CUDA C++ ✅ |
+| 性能分析工具 | — | Instruments.app | rocprof / rocm-smi | nsys / ncu |
+| 统一内存优势 | — | ✅ 核心优势 | ❌ | ❌ |
 
 #### 标准化 Benchmark 输出格式
 
 每个平台实验结束后，输出统一格式便于横向对比：
 ```
-平台:   Mac CPU M-series / NVIDIA A10 / AMD MI250
+平台:   Mac CPU M-series / Mac MPS / NVIDIA A10 / AMD MI250
 精度:   bfloat16 / float16 / int8
 TTFT:   xx ms（首 token 延迟）
 TBT:    xx ms（token 间平均延迟）
 Speed:  xx tokens/s
-RAM:    xx MB
+RAM/VRAM: xx MB
 ```
 
 ---
@@ -237,15 +400,16 @@ RAM:    xx MB
 ## 整体时间规划
 
 ```
-[Month 1] Phase 5-A/B/C（推理加速基础）
+[Month 1] Phase 5-A/B/C/D/F（推理加速基础 + macOS 深挖）
   Week 1：FlashAttention SDPA 替换 + MPS 实验
-  Week 2：W8A16 手写量化，对比内存与速度
-  Week 3：INT8 KV Cache 量化，评估长文本场景
-  Week 4：torch.compile decode 阶段实验
+  Week 2：torch.compile + 静态 KV Cache，验证 decode 图编译收益
+  Week 3：max_cache_len / prompt 长度 / dtype 扫描，理解 MPS 上的 trade-off
+  Week 4：MLX / mlx-lm 基线，对比 PyTorch MPS 与 Apple 原生推理生态
 
 [Month 2] Phase 6（硬件迁移）
-  Week 1-2：NVIDIA 云实例，CUDA Graph + nsys 入门
-  Week 3：AutoGPTQ W4 量化（配合 GPU 才能体现带宽优势）
+  Week 1：W8A16 手写量化，对比内存与速度
+  Week 2：INT8 KV Cache 量化，评估长文本场景
+  Week 3：NVIDIA 云实例，CUDA Graph + nsys 入门
   Week 4：AMD ROCm 迁移验证
 
 [Month 3] Phase 7（并发系统）
@@ -264,11 +428,15 @@ RAM:    xx MB
 - [x] 端到端自回归生成（Qwen3.5-0.8B，受数值精度限制）
 - [x] Qwen3-0.6B 纯全注意力推理，生成连贯中文文本
 - [x] KV Cache vs 无 Cache 量化 Benchmark（~3x 加速，O(N) vs O(N²) 实测）
-- [ ] FlashAttention SDPA 替换，测量加速比
+- [x] FlashAttention SDPA 替换（已内置到 `10_backend_benchmark.py`，CPU 实测约 2x）
+- [x] Mac MPS 后端实验（CPU/MPS、float16/float32 对比）
+- [x] torch.compile + 静态 KV Cache（MPS decode TBT 25-26ms → 12-13ms）
+- [ ] max_cache_len 扫描（32/64/128），评估静态 KV 固定长度成本
+- [ ] 动态 KV eager vs 静态 KV eager vs 静态 KV compile 三方对比
+- [ ] MLX / mlx-lm 本地推理 baseline（新增 `12_mlx_benchmark.py`）
 - [ ] W8A16 权重量化，内存降至 ~2.4GB
 - [ ] INT8 KV Cache 量化，为长文本场景做准备
-- [ ] Mac MPS 后端实验
-- [ ] NVIDIA GPU 迁移 + CUDA Graph
+- [ ] NVIDIA GPU 迁移 + CUDA Graph（`python 10_backend_benchmark.py --backend cuda`）
 - [ ] torch.profiler / nsys 性能分析
 - [ ] AutoGPTQ W4 量化 + PPL 评估
 - [ ] AMD ROCm 迁移验证
